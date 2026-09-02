@@ -7,10 +7,10 @@
     "bbPluginSdk": ">=0.4.35"
   },
   "bb": {
-    "name": "Github Notifications",
-    "description": "A BB plugin with an example todo list.",
+    "name": "Spoke",
+    "description": "A local inbox for GitHub pull request and issue notifications.",
     "branding": {
-      "icon": "ListTodo"
+      "icon": "Github"
     },
     "server": "./server.ts",
     "app": "./app.tsx"

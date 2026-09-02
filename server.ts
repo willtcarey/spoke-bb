@@ -1,225 +1,694 @@
-// bb-plugin-github-notifications — a BB plugin backend entry.
-//
-// The default export is a factory that receives the plugin API. BB supplies
-// the tiny defineRpcContract runtime helper; the API type remains type-only.
-//
-// The example is a todo list. One store in bb.storage.kv serves three
-// surfaces: the Example todos page (app.tsx, over RPC), the `bb github-notifications` CLI
-// command (below), and the skill in skills/example-todos/SKILL.md that tells
-// agents how to use that command. A write from any surface publishes a realtime signal so
-// every open page refetches.
 import { randomUUID } from "node:crypto";
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 
-const todoSchema = z.object({
+const notificationSchema = z.object({
   id: z.string(),
+  repository: z.string(),
+  repositoryUrl: z.string().url(),
   title: z.string(),
-  done: z.boolean(),
-  createdAt: z.string(),
+  type: z.enum(["pull_request", "issue", "other"]),
+  status: z.enum(["open", "closed", "merged"]).nullable(),
+  reason: z.string(),
+  url: z.string().url().nullable(),
+  unread: z.boolean(),
+  updatedAt: z.string(),
+  firstSeenAt: z.string(),
 });
-export type Todo = z.infer<typeof todoSchema>;
+export type Notification = z.infer<typeof notificationSchema>;
 
-// Both schemas run at the wire boundary. Handler input/output are inferred
-// from the shared contract; app.tsx imports only its type.
+const stateSchema = z.object({
+  notifications: z.array(notificationSchema),
+  counts: z.object({ pullRequests: z.number().int().nonnegative(), issues: z.number().int().nonnegative() }),
+  configured: z.boolean(),
+  syncing: z.boolean(),
+  lastSyncedAt: z.string().nullable(),
+  lastError: z.string().nullable(),
+});
+export type NotificationState = z.infer<typeof stateSchema>;
+
 export const rpcContract = defineRpcContract({
-  todos_list: {
+  notifications_state: { input: z.null(), output: stateSchema },
+  notifications_archive: {
+    input: z.object({ id: z.string().min(1).max(100) }).strict(),
+    output: z.object({ archived: z.boolean() }),
+  },
+  notifications_mark_read: {
+    input: z.object({ id: z.string().min(1).max(100) }).strict(),
+    output: z.object({ markedRead: z.boolean() }),
+  },
+  notifications_sync: { input: z.null(), output: stateSchema },
+  notifications_investigate: {
+    input: z.object({ id: z.string().min(1).max(100) }).strict(),
+    output: z.object({ threadId: z.string(), projectId: z.string() }),
+  },
+  oauth_start: {
     input: z.null(),
-    output: z.object({ todos: z.array(todoSchema) }),
+    output: z.object({
+      flowId: z.string(),
+      userCode: z.string(),
+      verificationUri: z.string().url(),
+      expiresAt: z.string(),
+      intervalSeconds: z.number().int().positive(),
+    }),
   },
-  todos_add: {
-    input: z.object({ title: z.string().trim().min(1).max(200) }),
-    output: todoSchema,
-  },
-  todos_set_done: {
-    input: z.object({ id: z.string(), done: z.boolean() }),
-    output: todoSchema,
-  },
-  todos_remove: {
-    input: z.object({ id: z.string() }),
-    output: z.object({ removed: z.boolean() }),
+  oauth_poll: {
+    input: z.object({ flowId: z.string().uuid() }).strict(),
+    output: z.object({
+      status: z.enum(["pending", "complete", "expired", "denied", "error"]),
+      retryAfterSeconds: z.number().int().nonnegative().nullable(),
+      message: z.string().nullable(),
+    }),
   },
 });
 
-/** Realtime channel app.tsx listens on; the payload is the todo count. */
-const TODOS_CHANGED = "todos-changed";
+const githubNotificationSchema = z.object({
+  id: z.string(),
+  unread: z.boolean(),
+  reason: z.string(),
+  updated_at: z.string(),
+  subject: z.object({
+    title: z.string(),
+    url: z.string().nullable(),
+    type: z.string(),
+  }),
+  repository: z.object({
+    full_name: z.string(),
+    html_url: z.string().url(),
+  }),
+});
+type GithubNotification = z.infer<typeof githubNotificationSchema>;
+type NotificationStatus = Notification["status"];
+type SyncedNotification = GithubNotification & { status: NotificationStatus };
+
+const githubSubjectSchema = z.object({
+  state: z.enum(["open", "closed"]),
+  merged_at: z.string().nullable().optional(),
+});
+
+type DeviceFlow = {
+  deviceCode: string;
+  expiresAt: number;
+  intervalSeconds: number;
+  nextPollAt: number;
+};
+
+const NOTIFICATIONS_CHANGED = "notifications-changed";
+const GITHUB_CLIENT_ID = "Ov23liseV7v7LbRDbOLY";
+const DEFAULT_POLL_SECONDS = 60;
+const MAX_PAGES = 10;
+
+function notificationType(type: string): Notification["type"] {
+  if (type === "PullRequest") return "pull_request";
+  if (type === "Issue") return "issue";
+  return "other";
+}
+
+function notificationStatus(value: unknown): NotificationStatus {
+  return value === "open" || value === "closed" || value === "merged" ? value : null;
+}
+
+function webUrl(notification: GithubNotification): string | null {
+  if (notification.subject.url === null) return notification.repository.html_url;
+  const number = notification.subject.url.match(/\/(?:pulls|issues)\/(\d+)$/)?.[1];
+  if (number === undefined) return notification.repository.html_url;
+  const segment = notification.subject.type === "PullRequest" ? "pull" : "issues";
+  return `${notification.repository.html_url}/${segment}/${number}`;
+}
+
+function nextPage(link: string | null): string | null {
+  if (link === null) return null;
+  for (const part of link.split(",")) {
+    const match = part.match(/<([^>]+)>;\s*rel="next"/);
+    if (match?.[1] !== undefined) return match[1];
+  }
+  return null;
+}
+
+function githubRepositorySlug(remoteUrl: string | null): string | null {
+  if (remoteUrl === null) return null;
+  const withoutSuffix = remoteUrl.trim().replace(/\/+$/, "").replace(/\.git$/i, "");
+  const match = withoutSuffix.match(
+    /^(?:https?:\/\/github\.com\/|ssh:\/\/(?:git@)?github\.com(?::\d+)?\/|git@github\.com:)([^/\s]+)\/([^/#\s]+)$/i,
+  );
+  return match === null ? null : `${match[1]}/${match[2]}`.toLowerCase();
+}
+
+function sleep(milliseconds: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, milliseconds);
+    signal.addEventListener("abort", () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
 
 export default async function plugin(bb: BbPluginApi) {
-  bb.log.info("loaded");
-
-  // Declarative settings — rendered in BB's settings UI and editable with
-  // `bb plugin config github-notifications`. Add `secret: true` for values like API keys.
-  // Settings are read once per load: reload the plugin after changing one.
   const settings = bb.settings.define({
-    showDone: {
-      type: "boolean",
-      label: "Show completed todos",
-      default: true,
+    token: { type: "string", label: "GitHub personal access token", secret: true },
+    pollInterval: {
+      type: "select",
+      label: "Polling interval",
+      options: ["60", "120", "300"],
+      default: "60",
     },
   });
-  const { showDone } = await settings.get();
 
-  // Namespaced key-value storage in bb.db (JSON values, up to 256KB each).
-  // For bigger or relational data use bb.storage.database().
-  async function readTodos(): Promise<Todo[]> {
-    return (await bb.storage.kv.get<Todo[]>("todos")) ?? [];
-  }
-  async function writeTodos(todos: Todo[]): Promise<void> {
-    await bb.storage.kv.set("todos", todos);
-    // Ephemeral broadcast to every connected client; nothing is persisted.
-    bb.realtime.publish(TODOS_CHANGED, { count: todos.length });
-  }
+  // Stay healthy while disconnected so the sidebar panel remains available;
+  // the panel itself owns the OAuth setup flow.
+  const initialSettings = await settings.get();
 
-  async function listTodos(): Promise<Todo[]> {
-    const todos = await readTodos();
-    return showDone ? todos : todos.filter((todo) => !todo.done);
-  }
-  async function addTodo(title: string): Promise<Todo> {
-    const todo: Todo = {
-      id: randomUUID().slice(0, 8),
-      title,
-      done: false,
-      createdAt: new Date().toISOString(),
+  const db = bb.storage.database();
+  bb.storage.migrate(db, [
+    `
+      CREATE TABLE notifications (
+        id TEXT PRIMARY KEY,
+        repository TEXT NOT NULL,
+        repository_url TEXT NOT NULL,
+        title TEXT NOT NULL,
+        type TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        url TEXT,
+        unread INTEGER NOT NULL,
+        github_updated_at TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        synced_at TEXT NOT NULL,
+        archived_at TEXT
+      );
+      CREATE INDEX notifications_inbox ON notifications (archived_at, github_updated_at DESC);
+      CREATE TABLE sync_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        etag TEXT,
+        last_synced_at TEXT,
+        last_error TEXT,
+        poll_seconds INTEGER NOT NULL DEFAULT 60
+      );
+      INSERT INTO sync_state (id) VALUES (1);
+    `,
+    "ALTER TABLE notifications ADD COLUMN status TEXT;",
+    "UPDATE sync_state SET etag = NULL;",
+  ]);
+
+  let syncInFlight: Promise<void> | null = null;
+  let configured = Boolean(initialSettings.token);
+  const deviceFlows = new Map<string, DeviceFlow>();
+
+  function readState(): NotificationState {
+    const rows = db.prepare(`
+      SELECT id, repository, repository_url, title, type, status, reason, url, unread,
+             github_updated_at, first_seen_at
+      FROM notifications
+      WHERE archived_at IS NULL
+      ORDER BY github_updated_at DESC
+      LIMIT 500
+    `).all() as Array<Record<string, unknown>>;
+    const notifications = rows.map((row) => ({
+      id: String(row.id),
+      repository: String(row.repository),
+      repositoryUrl: String(row.repository_url),
+      title: String(row.title),
+      type: notificationType(String(row.type) === "pull_request" ? "PullRequest" : String(row.type) === "issue" ? "Issue" : "Other"),
+      status: notificationStatus(row.status),
+      reason: String(row.reason),
+      url: row.url === null ? null : String(row.url),
+      unread: row.unread === 1,
+      updatedAt: String(row.github_updated_at),
+      firstSeenAt: String(row.first_seen_at),
+    }));
+    const counts = db.prepare(`
+      SELECT
+        SUM(CASE WHEN type = 'pull_request' AND unread = 1 THEN 1 ELSE 0 END) AS pull_requests,
+        SUM(CASE WHEN type = 'issue' AND unread = 1 THEN 1 ELSE 0 END) AS issues
+      FROM notifications WHERE archived_at IS NULL
+    `).get() as { pull_requests: number | null; issues: number | null };
+    const sync = db.prepare("SELECT last_synced_at, last_error FROM sync_state WHERE id = 1").get() as {
+      last_synced_at: string | null;
+      last_error: string | null;
     };
-    await writeTodos([...(await readTodos()), todo]);
-    return todo;
+    return {
+      notifications,
+      counts: { pullRequests: counts.pull_requests ?? 0, issues: counts.issues ?? 0 },
+      configured,
+      syncing: syncInFlight !== null,
+      lastSyncedAt: sync.last_synced_at,
+      lastError: sync.last_error,
+    };
   }
-  async function setTodoDone(id: string, done: boolean): Promise<Todo | null> {
-    const todos = await readTodos();
-    const todo = todos.find((candidate) => candidate.id === id);
-    if (todo === undefined) return null;
-    todo.done = done;
-    await writeTodos(todos);
-    return todo;
+
+  const upsert = db.prepare(`
+    INSERT INTO notifications (
+      id, repository, repository_url, title, type, status, reason, url, unread,
+      github_updated_at, first_seen_at, synced_at, archived_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    ON CONFLICT(id) DO UPDATE SET
+      repository = excluded.repository,
+      repository_url = excluded.repository_url,
+      title = excluded.title,
+      type = excluded.type,
+      status = COALESCE(excluded.status, notifications.status),
+      reason = excluded.reason,
+      url = excluded.url,
+      unread = excluded.unread,
+      archived_at = CASE
+        WHEN excluded.github_updated_at > notifications.github_updated_at THEN NULL
+        ELSE notifications.archived_at
+      END,
+      github_updated_at = excluded.github_updated_at,
+      synced_at = excluded.synced_at
+  `);
+
+  const persistSync = db.transaction((notifications: SyncedNotification[], etag: string | null, pollSeconds: number, complete: boolean) => {
+    const now = new Date().toISOString();
+    if (complete) db.prepare("UPDATE notifications SET unread = 0").run();
+    for (const notification of notifications) {
+      upsert.run(
+        notification.id,
+        notification.repository.full_name,
+        notification.repository.html_url,
+        notification.subject.title,
+        notificationType(notification.subject.type),
+        notification.status,
+        notification.reason,
+        webUrl(notification),
+        notification.unread ? 1 : 0,
+        notification.updated_at,
+        now,
+        now,
+      );
+    }
+    db.prepare(`
+      UPDATE sync_state
+      SET etag = ?, last_synced_at = ?, last_error = NULL, poll_seconds = ?
+      WHERE id = 1
+    `).run(etag, now, pollSeconds);
+  });
+
+  async function enrichNotificationStatuses(
+    notifications: GithubNotification[],
+    headers: Record<string, string>,
+  ): Promise<SyncedNotification[]> {
+    const cachedStatus = db.prepare(`
+      SELECT github_updated_at, status FROM notifications WHERE id = ?
+    `);
+    const enriched: SyncedNotification[] = [];
+    let failed = 0;
+
+    for (let offset = 0; offset < notifications.length; offset += 8) {
+      const batch = notifications.slice(offset, offset + 8);
+      const results = await Promise.all(batch.map(async (notification): Promise<SyncedNotification> => {
+        const cached = cachedStatus.get(notification.id) as { github_updated_at: string; status: string | null } | undefined;
+        const validCachedStatus = cached?.status === "open" || cached?.status === "closed" || cached?.status === "merged"
+          ? cached.status
+          : null;
+        if (cached?.github_updated_at === notification.updated_at && validCachedStatus !== null) {
+          return { ...notification, status: validCachedStatus };
+        }
+        if (
+          notification.subject.url === null
+          || (notification.subject.type !== "PullRequest" && notification.subject.type !== "Issue")
+        ) {
+          return { ...notification, status: validCachedStatus };
+        }
+
+        try {
+          const response = await fetch(notification.subject.url, { headers });
+          if (!response.ok) {
+            failed += 1;
+            return { ...notification, status: validCachedStatus };
+          }
+          const subject = githubSubjectSchema.parse(await response.json());
+          const status: NotificationStatus = notification.subject.type === "PullRequest" && subject.merged_at
+            ? "merged"
+            : subject.state;
+          return { ...notification, status };
+        } catch {
+          failed += 1;
+          return { ...notification, status: validCachedStatus };
+        }
+      }));
+      enriched.push(...results);
+    }
+
+    if (failed > 0) bb.log.warn(`Could not refresh state for ${failed} GitHub notification${failed === 1 ? "" : "s"}.`);
+    return enriched;
   }
-  async function removeTodo(id: string): Promise<boolean> {
-    const todos = await readTodos();
-    const remaining = todos.filter((todo) => todo.id !== id);
-    if (remaining.length === todos.length) return false;
-    await writeTodos(remaining);
-    return true;
+
+  async function backfillStoredStatuses(headers: Record<string, string>): Promise<void> {
+    const rows = db.prepare(`
+      SELECT id, repository, type, url
+      FROM notifications
+      WHERE status IS NULL AND type IN ('pull_request', 'issue') AND url IS NOT NULL
+      LIMIT 500
+    `).all() as Array<{ id: string; repository: string; type: "pull_request" | "issue"; url: string }>;
+    const updateStatus = db.prepare("UPDATE notifications SET status = ? WHERE id = ?");
+
+    for (let offset = 0; offset < rows.length; offset += 8) {
+      await Promise.all(rows.slice(offset, offset + 8).map(async (row) => {
+        const number = row.url.match(/\/(?:pull|issues)\/(\d+)(?:$|[?#])/)?.[1];
+        if (number === undefined) return;
+        const endpoint = `https://api.github.com/repos/${row.repository}/${row.type === "pull_request" ? "pulls" : "issues"}/${number}`;
+        try {
+          const response = await fetch(endpoint, { headers });
+          if (!response.ok) return;
+          const subject = githubSubjectSchema.parse(await response.json());
+          const status: NotificationStatus = row.type === "pull_request" && subject.merged_at
+            ? "merged"
+            : subject.state;
+          updateStatus.run(status, row.id);
+        } catch {
+          // Status is supplementary; leave it unknown if GitHub cannot provide it.
+        }
+      }));
+    }
+  }
+
+  async function performSync(): Promise<void> {
+    const { token } = await settings.get();
+    if (!token) throw new Error("Configure a GitHub personal access token first.");
+
+    const sync = db.prepare("SELECT etag FROM sync_state WHERE id = 1").get() as { etag: string | null };
+    const headers: Record<string, string> = {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${token}`,
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "bb-github-notifications-plugin",
+    };
+    if (sync.etag !== null) headers["If-None-Match"] = sync.etag;
+
+    let url: string | null = "https://api.github.com/notifications?all=false&participating=false&per_page=100";
+    const notifications: GithubNotification[] = [];
+    let etag: string | null = sync.etag;
+    let pollSeconds = DEFAULT_POLL_SECONDS;
+
+    for (let page = 0; url !== null && page < MAX_PAGES; page += 1) {
+      const pageHeaders = { ...headers };
+      if (page > 0) delete pageHeaders["If-None-Match"];
+      const response = await fetch(url, { headers: pageHeaders });
+      if (page === 0 && response.status === 304) {
+        const now = new Date().toISOString();
+        db.prepare("UPDATE sync_state SET last_synced_at = ?, last_error = NULL WHERE id = 1").run(now);
+        const detailHeaders = { ...headers };
+        delete detailHeaders["If-None-Match"];
+        await backfillStoredStatuses(detailHeaders);
+        return;
+      }
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 300);
+        throw new Error(`GitHub notifications request failed (${response.status})${detail ? `: ${detail}` : ""}`);
+      }
+      if (page === 0) {
+        etag = response.headers.get("etag");
+        const suggested = Number(response.headers.get("x-poll-interval"));
+        if (Number.isFinite(suggested)) pollSeconds = Math.max(DEFAULT_POLL_SECONDS, suggested);
+      }
+      notifications.push(...z.array(githubNotificationSchema).parse(await response.json()));
+      url = nextPage(response.headers.get("link"));
+    }
+
+    const detailHeaders = { ...headers };
+    delete detailHeaders["If-None-Match"];
+    const enriched = await enrichNotificationStatuses(notifications, detailHeaders);
+    persistSync(enriched, etag, pollSeconds, url === null);
+    await backfillStoredStatuses(detailHeaders);
+  }
+
+  async function syncNow(): Promise<void> {
+    if (syncInFlight !== null) return syncInFlight;
+    bb.realtime.publish(NOTIFICATIONS_CHANGED, { syncing: true });
+    syncInFlight = performSync()
+      .catch((cause: unknown) => {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        db.prepare("UPDATE sync_state SET last_error = ? WHERE id = 1").run(message);
+        throw cause;
+      })
+      .finally(() => {
+        syncInFlight = null;
+        bb.realtime.publish(NOTIFICATIONS_CHANGED, { syncing: false });
+      });
+    return syncInFlight;
+  }
+
+  async function markNotificationRead(id: string): Promise<{ markedRead: boolean }> {
+    const result = db.prepare(`
+      UPDATE notifications SET unread = 0
+      WHERE id = ? AND unread = 1 AND archived_at IS NULL
+    `).run(id);
+    const markedRead = result.changes > 0;
+    if (!markedRead) return { markedRead };
+
+    bb.realtime.publish(NOTIFICATIONS_CHANGED, { markedRead: id });
+
+    const { token } = await settings.get();
+    if (token) {
+      try {
+        const response = await fetch(`https://api.github.com/notifications/threads/${encodeURIComponent(id)}`, {
+          method: "PATCH",
+          headers: {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${token}`,
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "bb-github-notifications-plugin",
+          },
+        });
+        if (!response.ok) {
+          bb.log.warn(`Could not mark GitHub notification ${id} as read (${response.status}).`);
+        }
+      } catch (cause) {
+        bb.log.warn(`Could not mark GitHub notification ${id} as read: ${cause instanceof Error ? cause.message : String(cause)}`);
+      }
+    }
+
+    return { markedRead };
+  }
+
+  async function investigateNotification(id: string) {
+    const notification = db.prepare(`
+      SELECT repository, title, type, url
+      FROM notifications
+      WHERE id = ? AND archived_at IS NULL
+    `).get(id) as { repository: string; title: string; type: string; url: string | null } | undefined;
+
+    if (notification === undefined) throw new Error("That notification is no longer in the inbox.");
+    if (notification.type !== "pull_request" || notification.url === null) {
+      throw new Error("Only pull request notifications can be investigated.");
+    }
+
+    const repository = notification.repository.toLowerCase();
+    const projects = await bb.sdk.projects.list();
+    const project = projects.find((candidate) => githubRepositorySlug(candidate.gitRemoteUrl) === repository);
+    if (project === undefined) {
+      throw new Error(`No BB project has a GitHub remote for ${notification.repository}. Add the repository as a project first.`);
+    }
+
+    const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: project.id });
+    const hostId = project.sources.find((source) => source.isDefault)?.hostId ?? project.sources[0]?.hostId;
+    const providers = await bb.sdk.providers.list(hostId === undefined ? {} : { hostId });
+    const candidates = [
+      ...providers.filter((provider) => provider.id === defaults?.providerId),
+      ...providers.filter((provider) => provider.id !== defaults?.providerId),
+    ];
+
+    let execution: { providerId: string; model: string; reasoningLevel: NonNullable<typeof defaults>["reasoningLevel"] } | null = null;
+    for (const provider of candidates) {
+      if (!provider.available || provider.capabilities.modelCatalogScope !== "host") continue;
+      try {
+        const catalog = hostId === undefined
+          ? await bb.sdk.providers.models({ providerId: provider.id })
+          : await bb.sdk.providers.models({ providerId: provider.id, hostId });
+        const preferredModel = provider.id === defaults?.providerId
+          ? catalog.models.find((model) => model.model === defaults.model || model.id === defaults.model)
+          : undefined;
+        const model = preferredModel ?? catalog.models.find((candidate) => candidate.isDefault) ?? catalog.models[0];
+        if (model === undefined) continue;
+        const supportedReasoning = model.supportedReasoningEfforts.map((effort) => effort.reasoningEffort);
+        const reasoningLevel = provider.id === defaults?.providerId && supportedReasoning.includes(defaults.reasoningLevel)
+          ? defaults.reasoningLevel
+          : model.defaultReasoningEffort;
+        execution = { providerId: provider.id, model: model.model, reasoningLevel };
+        break;
+      } catch (cause) {
+        bb.log.warn(`Could not load ${provider.displayName} models for PR review: ${cause instanceof Error ? cause.message : String(cause)}`);
+      }
+    }
+    if (execution === null) {
+      throw new Error("No agent provider with available models can start this review. Connect a provider on the project's machine and try again.");
+    }
+
+    const thread = await bb.sdk.threads.spawn({
+      projectId: project.id,
+      environment: { type: "project-default" },
+      providerId: execution.providerId,
+      model: execution.model,
+      reasoningLevel: execution.reasoningLevel,
+      executionInputSources: {
+        providerId: "explicit",
+        model: "explicit",
+        reasoningLevel: "explicit",
+      },
+      title: `Review PR: ${notification.title}`,
+      prompt: [
+        `Review this GitHub pull request notification: ${notification.url}`,
+        `Repository: ${notification.repository}`,
+        `Title: ${notification.title}`,
+        "Inspect the pull request, its changes, discussion, review state, and CI status. Summarize what needs attention, identify risks or blockers, and recommend the next action. Do not modify code unless I ask you to after the investigation.",
+      ].join("\n\n"),
+    });
+
+    return { threadId: thread.id, projectId: project.id };
+  }
+
+  async function startDeviceFlow() {
+    const response = await fetch("https://github.com/login/device/code", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      body: new URLSearchParams({
+        client_id: GITHUB_CLIENT_ID,
+        scope: "notifications",
+      }),
+    });
+    const payload: unknown = await response.json();
+    if (!response.ok) {
+      const failure = z.object({ error_description: z.string().optional() }).safeParse(payload);
+      const detail = failure.success ? failure.data.error_description : undefined;
+      throw new Error(detail ?? `GitHub login could not start (${response.status}).`);
+    }
+    const result = z.object({
+      device_code: z.string(),
+      user_code: z.string(),
+      verification_uri: z.string().url(),
+      expires_in: z.number().int().positive(),
+      interval: z.number().int().positive().default(5),
+    }).parse(payload);
+    const flowId = randomUUID();
+    const expiresAt = Date.now() + result.expires_in * 1000;
+    deviceFlows.set(flowId, {
+      deviceCode: result.device_code,
+      expiresAt,
+      intervalSeconds: result.interval,
+      nextPollAt: Date.now() + result.interval * 1000,
+    });
+    return {
+      flowId,
+      userCode: result.user_code,
+      verificationUri: result.verification_uri,
+      expiresAt: new Date(expiresAt).toISOString(),
+      intervalSeconds: result.interval,
+    };
+  }
+
+  async function pollDeviceFlow(flowId: string) {
+    const flow = deviceFlows.get(flowId);
+    if (flow === undefined) {
+      return { status: "expired" as const, retryAfterSeconds: null, message: "This login session is no longer available." };
+    }
+    if (Date.now() >= flow.expiresAt) {
+      deviceFlows.delete(flowId);
+      return { status: "expired" as const, retryAfterSeconds: null, message: "The GitHub login code expired." };
+    }
+    if (Date.now() < flow.nextPollAt) {
+      return {
+        status: "pending" as const,
+        retryAfterSeconds: Math.max(1, Math.ceil((flow.nextPollAt - Date.now()) / 1000)),
+        message: null,
+      };
+    }
+
+    flow.nextPollAt = Date.now() + flow.intervalSeconds * 1000;
+    const response = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: { Accept: "application/json" },
+      body: new URLSearchParams({
+        client_id: GITHUB_CLIENT_ID,
+        device_code: flow.deviceCode,
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+      }),
+    });
+    if (!response.ok) throw new Error(`GitHub login failed (${response.status}).`);
+    const result = z.object({
+      access_token: z.string().optional(),
+      error: z.string().optional(),
+      error_description: z.string().optional(),
+      interval: z.number().int().positive().optional(),
+    }).parse(await response.json());
+
+    if (result.access_token !== undefined) {
+      deviceFlows.delete(flowId);
+      configured = true;
+      await settings.experimental_set({ token: result.access_token });
+      bb.realtime.publish(NOTIFICATIONS_CHANGED, { configured: true });
+      return { status: "complete" as const, retryAfterSeconds: null, message: null };
+    }
+    if (result.error === "authorization_pending") {
+      return { status: "pending" as const, retryAfterSeconds: flow.intervalSeconds, message: null };
+    }
+    if (result.error === "slow_down") {
+      flow.intervalSeconds = (result.interval ?? flow.intervalSeconds) + 5;
+      flow.nextPollAt = Date.now() + flow.intervalSeconds * 1000;
+      return { status: "pending" as const, retryAfterSeconds: flow.intervalSeconds, message: null };
+    }
+
+    deviceFlows.delete(flowId);
+    if (result.error === "access_denied") {
+      return { status: "denied" as const, retryAfterSeconds: null, message: result.error_description ?? "GitHub login was cancelled." };
+    }
+    if (result.error === "expired_token") {
+      return { status: "expired" as const, retryAfterSeconds: null, message: result.error_description ?? "The GitHub login code expired." };
+    }
+    return {
+      status: "error" as const,
+      retryAfterSeconds: null,
+      message: result.error_description ?? "GitHub returned an unknown login error.",
+    };
   }
 
   bb.rpc.register(rpcContract, {
-    todos_list: async () => ({ todos: await listTodos() }),
-    todos_add: ({ title }) => addTodo(title),
-    todos_set_done: async ({ id, done }) => {
-      const todo = await setTodoDone(id, done);
-      if (todo === null) throw new Error(`No todo with id ${id}`);
-      return todo;
+    notifications_state: () => readState(),
+    notifications_archive: ({ id }) => {
+      const result = db.prepare(`
+        UPDATE notifications SET archived_at = ? WHERE id = ? AND archived_at IS NULL
+      `).run(new Date().toISOString(), id);
+      const archived = result.changes > 0;
+      if (archived) bb.realtime.publish(NOTIFICATIONS_CHANGED, { archived: id });
+      return { archived };
     },
-    todos_remove: async ({ id }) => ({ removed: await removeTodo(id) }),
+    notifications_mark_read: ({ id }) => markNotificationRead(id),
+    notifications_sync: async () => {
+      await syncNow();
+      return readState();
+    },
+    notifications_investigate: ({ id }) => investigateNotification(id),
+    oauth_start: () => startDeviceFlow(),
+    oauth_poll: ({ flowId }) => pollDeviceFlow(flowId),
   });
 
-  // The `bb github-notifications` command: what agents (and you) use from a shell. Parsing
-  // argv is plugin-owned; `commands` is metadata BB renders into help and
-  // the generated plugin-commands skill without running plugin code.
-  const usage = [
-    "Usage:",
-    "  bb github-notifications list [--json]",
-    "  bb github-notifications add <title> [--json]",
-    "  bb github-notifications done <todo-id> [--json]",
-    "  bb github-notifications undo <todo-id> [--json]",
-    "  bb github-notifications remove <todo-id> [--json]",
-  ].join("\n");
-  function formatTodo(todo: Todo): string {
-    return `[${todo.done ? "x" : " "}] ${todo.id}  ${todo.title}`;
-  }
-  bb.cli.register({
-    name: "github-notifications",
-    summary: "Manage the Github Notifications plugin's example todo list",
-    commands: [
-      { name: "list", summary: "List todos", usage: "bb github-notifications list [--json]" },
-      {
-        name: "add",
-        summary: "Add a todo",
-        usage: "bb github-notifications add <title> [--json]",
-      },
-      {
-        name: "done",
-        summary: "Mark a todo done",
-        usage: "bb github-notifications done <todo-id> [--json]",
-      },
-      {
-        name: "undo",
-        summary: "Mark a todo not done",
-        usage: "bb github-notifications undo <todo-id> [--json]",
-      },
-      {
-        name: "remove",
-        summary: "Remove a todo",
-        usage: "bb github-notifications remove <todo-id> [--json]",
-      },
-    ],
-    async run(argv) {
-      const json = argv.includes("--json");
-      const [command, ...args] = argv.filter((arg) => arg !== "--json");
-      const reply = (value: unknown, text: string) => ({
-        exitCode: 0,
-        stdout: json ? JSON.stringify(value) : text,
-      });
-      const notFound = (missingId: string) => ({
-        exitCode: 1,
-        stderr: `No todo with id ${missingId}. Run "bb github-notifications list" to see ids.`,
-      });
-      const todoId = args[0];
-      switch (command) {
-        case undefined:
-        case "help":
-        case "--help":
-          return { exitCode: 0, stdout: usage };
-        case "list": {
-          const todos = await listTodos();
-          return reply(
-            todos,
-            todos.length === 0 ? "No todos." : todos.map(formatTodo).join("\n"),
-          );
+  bb.background.service("github-notifications-poller", {
+    async start(signal) {
+      while (!signal.aborted) {
+        const { token, pollInterval } = await settings.get();
+        if (token) {
+          try {
+            await syncNow();
+          } catch (cause) {
+            bb.log.warn(cause instanceof Error ? cause.message : String(cause));
+          }
         }
-        case "add": {
-          const title = args.join(" ").trim();
-          if (title === "") break;
-          const todo = await addTodo(title);
-          return reply(todo, `Added ${formatTodo(todo)}`);
-        }
-        case "done":
-        case "undo": {
-          if (todoId === undefined || args.length !== 1) break;
-          const todo = await setTodoDone(todoId, command === "done");
-          if (todo === null) return notFound(todoId);
-          return reply(todo, formatTodo(todo));
-        }
-        case "remove": {
-          if (todoId === undefined || args.length !== 1) break;
-          if (!(await removeTodo(todoId))) return notFound(todoId);
-          return reply({ removed: true, id: todoId }, `Removed ${todoId}`);
-        }
+        const state = db.prepare("SELECT poll_seconds FROM sync_state WHERE id = 1").get() as { poll_seconds: number };
+        const configuredSeconds = Number(pollInterval) || DEFAULT_POLL_SECONDS;
+        await sleep(Math.max(configuredSeconds, state.poll_seconds) * 1000, signal);
       }
-      return { exitCode: 1, stderr: usage };
     },
   });
 
-  // Cleanup on reload/disable/shutdown; hooks run LIFO. The sanctioned place
-  // to clear timers and close connections.
-  bb.onDispose(() => {
-    bb.log.info("disposed");
+  settings.onChange((next) => {
+    configured = Boolean(next.token);
+    bb.realtime.publish(NOTIFICATIONS_CHANGED, { configured });
+    if (!configured) return;
+    void syncNow().catch((cause: unknown) => {
+      bb.log.warn(cause instanceof Error ? cause.message : String(cause));
+    });
   });
 
-  // Long-lived background work: starts after load, gets an AbortSignal on
-  // reload/disable/shutdown, and restarts with backoff if it crashes. Sleeps
-  // must wake on abort — a plain setTimeout sleeps through the stop window
-  // and the plugin reports "degraded (service did not stop)" on reload.
-  // bb.background.service("worker", {
-  //   async start(signal) {
-  //     while (!signal.aborted) {
-  //       await new Promise((resolve) => {
-  //         const timer = setTimeout(resolve, 60_000);
-  //         signal.addEventListener(
-  //           "abort",
-  //           () => { clearTimeout(timer); resolve(undefined); },
-  //           { once: true },
-  //         );
-  //       });
-  //     }
-  //   },
-  // });
+  bb.log.info("loaded");
 }
