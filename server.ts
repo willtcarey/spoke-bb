@@ -79,7 +79,6 @@ const githubNotificationSchema = z.object({
 });
 type GithubNotification = z.infer<typeof githubNotificationSchema>;
 type NotificationStatus = Notification["status"];
-type SyncedNotification = GithubNotification & { status: NotificationStatus };
 
 const githubSubjectSchema = z.object({
   state: z.enum(["open", "closed"]),
@@ -189,6 +188,7 @@ export default async function plugin(bb: BbPluginApi) {
     `,
     "ALTER TABLE notifications ADD COLUMN status TEXT;",
     "UPDATE sync_state SET etag = NULL;",
+    "ALTER TABLE notifications ADD COLUMN status_etag TEXT;",
   ]);
 
   let syncInFlight: Promise<void> | null = null;
@@ -259,7 +259,7 @@ export default async function plugin(bb: BbPluginApi) {
       synced_at = excluded.synced_at
   `);
 
-  const persistSync = db.transaction((notifications: SyncedNotification[], etag: string | null, pollSeconds: number, complete: boolean) => {
+  const persistSync = db.transaction((notifications: GithubNotification[], etag: string | null, pollSeconds: number, complete: boolean) => {
     const now = new Date().toISOString();
     if (complete) db.prepare("UPDATE notifications SET unread = 0").run();
     for (const notification of notifications) {
@@ -269,7 +269,7 @@ export default async function plugin(bb: BbPluginApi) {
         notification.repository.html_url,
         notification.subject.title,
         notificationType(notification.subject.type),
-        notification.status,
+        null,
         notification.reason,
         webUrl(notification),
         notification.unread ? 1 : 0,
@@ -285,82 +285,53 @@ export default async function plugin(bb: BbPluginApi) {
     `).run(etag, now, pollSeconds);
   });
 
-  async function enrichNotificationStatuses(
-    notifications: GithubNotification[],
-    headers: Record<string, string>,
-  ): Promise<SyncedNotification[]> {
-    const cachedStatus = db.prepare(`
-      SELECT github_updated_at, status FROM notifications WHERE id = ?
-    `);
-    const enriched: SyncedNotification[] = [];
-    let failed = 0;
-
-    for (let offset = 0; offset < notifications.length; offset += 8) {
-      const batch = notifications.slice(offset, offset + 8);
-      const results = await Promise.all(batch.map(async (notification): Promise<SyncedNotification> => {
-        const cached = cachedStatus.get(notification.id) as { github_updated_at: string; status: string | null } | undefined;
-        const validCachedStatus = cached?.status === "open" || cached?.status === "closed" || cached?.status === "merged"
-          ? cached.status
-          : null;
-        if (cached?.github_updated_at === notification.updated_at && validCachedStatus !== null) {
-          return { ...notification, status: validCachedStatus };
-        }
-        if (
-          notification.subject.url === null
-          || (notification.subject.type !== "PullRequest" && notification.subject.type !== "Issue")
-        ) {
-          return { ...notification, status: validCachedStatus };
-        }
-
-        try {
-          const response = await fetch(notification.subject.url, { headers });
-          if (!response.ok) {
-            failed += 1;
-            return { ...notification, status: validCachedStatus };
-          }
-          const subject = githubSubjectSchema.parse(await response.json());
-          const status: NotificationStatus = notification.subject.type === "PullRequest" && subject.merged_at
-            ? "merged"
-            : subject.state;
-          return { ...notification, status };
-        } catch {
-          failed += 1;
-          return { ...notification, status: validCachedStatus };
-        }
-      }));
-      enriched.push(...results);
-    }
-
-    if (failed > 0) bb.log.warn(`Could not refresh state for ${failed} GitHub notification${failed === 1 ? "" : "s"}.`);
-    return enriched;
-  }
-
-  async function backfillStoredStatuses(headers: Record<string, string>): Promise<void> {
+  async function refreshStoredStatuses(headers: Record<string, string>): Promise<void> {
     const rows = db.prepare(`
-      SELECT id, repository, type, url
+      SELECT id, repository, type, url, status_etag
       FROM notifications
-      WHERE status IS NULL AND type IN ('pull_request', 'issue') AND url IS NOT NULL
+      WHERE archived_at IS NULL AND type IN ('pull_request', 'issue') AND url IS NOT NULL
       LIMIT 500
-    `).all() as Array<{ id: string; repository: string; type: "pull_request" | "issue"; url: string }>;
-    const updateStatus = db.prepare("UPDATE notifications SET status = ? WHERE id = ?");
+    `).all() as Array<{
+      id: string;
+      repository: string;
+      type: "pull_request" | "issue";
+      url: string;
+      status_etag: string | null;
+    }>;
+    const updateStatus = db.prepare("UPDATE notifications SET status = ?, status_etag = ? WHERE id = ?");
+    const failures = new Map<string, number>();
+    const recordFailure = (reason: string) => failures.set(reason, (failures.get(reason) ?? 0) + 1);
 
     for (let offset = 0; offset < rows.length; offset += 8) {
       await Promise.all(rows.slice(offset, offset + 8).map(async (row) => {
         const number = row.url.match(/\/(?:pull|issues)\/(\d+)(?:$|[?#])/)?.[1];
         if (number === undefined) return;
         const endpoint = `https://api.github.com/repos/${row.repository}/${row.type === "pull_request" ? "pulls" : "issues"}/${number}`;
+        const detailHeaders = { ...headers };
+        if (row.status_etag !== null) detailHeaders["If-None-Match"] = row.status_etag;
+
         try {
-          const response = await fetch(endpoint, { headers });
-          if (!response.ok) return;
+          const response = await fetch(endpoint, { headers: detailHeaders });
+          if (response.status === 304) return;
+          if (!response.ok) {
+            recordFailure(`HTTP ${response.status}`);
+            return;
+          }
           const subject = githubSubjectSchema.parse(await response.json());
           const status: NotificationStatus = row.type === "pull_request" && subject.merged_at
             ? "merged"
             : subject.state;
-          updateStatus.run(status, row.id);
-        } catch {
-          // Status is supplementary; leave it unknown if GitHub cannot provide it.
+          updateStatus.run(status, response.headers.get("etag"), row.id);
+        } catch (cause) {
+          recordFailure(cause instanceof z.ZodError ? "invalid response" : "request error");
         }
       }));
+    }
+
+    const failed = [...failures.values()].reduce((total, count) => total + count, 0);
+    if (failed > 0) {
+      const summary = [...failures].map(([reason, count]) => `${reason}: ${count}`).join(", ");
+      bb.log.warn(`Could not refresh state for ${failed} GitHub notification${failed === 1 ? "" : "s"} (${summary}).`);
     }
   }
 
@@ -391,7 +362,7 @@ export default async function plugin(bb: BbPluginApi) {
         db.prepare("UPDATE sync_state SET last_synced_at = ?, last_error = NULL WHERE id = 1").run(now);
         const detailHeaders = { ...headers };
         delete detailHeaders["If-None-Match"];
-        await backfillStoredStatuses(detailHeaders);
+        await refreshStoredStatuses(detailHeaders);
         return;
       }
       if (!response.ok) {
@@ -409,9 +380,8 @@ export default async function plugin(bb: BbPluginApi) {
 
     const detailHeaders = { ...headers };
     delete detailHeaders["If-None-Match"];
-    const enriched = await enrichNotificationStatuses(notifications, detailHeaders);
-    persistSync(enriched, etag, pollSeconds, url === null);
-    await backfillStoredStatuses(detailHeaders);
+    persistSync(notifications, etag, pollSeconds, url === null);
+    await refreshStoredStatuses(detailHeaders);
   }
 
   async function syncNow(): Promise<void> {
@@ -545,7 +515,8 @@ export default async function plugin(bb: BbPluginApi) {
       headers: { Accept: "application/json" },
       body: new URLSearchParams({
         client_id: GITHUB_CLIENT_ID,
-        scope: "notifications",
+        // Repository access is required to read state for private pull requests and issues.
+        scope: "notifications repo",
       }),
     });
     const payload: unknown = await response.json();

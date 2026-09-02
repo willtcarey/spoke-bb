@@ -164,8 +164,6 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
   const isIssue = notification.type === "issue";
   const icon = isPullRequest ? "GitPullRequest" : isIssue ? "CircleDot" : "Mail";
   const typeLabel = isPullRequest ? "Pull request" : isIssue ? "Issue" : "Notification";
-  const statusLabel = notification.status === "open" ? "Open" : notification.status === "merged" ? "Merged" : notification.status === "closed" ? "Closed" : null;
-  const statusIcon = notification.status === "merged" ? "GitMerge" : notification.status === "closed" ? "CircleX" : "Circle";
   return (
     <li className={cn(
       "group relative flex gap-3.5 px-4 py-3 transition-colors hover:bg-state-hover/60",
@@ -174,7 +172,12 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
       {notification.unread ? (
         <span className="absolute inset-y-3 left-0 w-0.5 rounded-r-full bg-blue-500" aria-hidden="true" />
       ) : null}
-      <div className="flex size-9 shrink-0 items-center justify-center text-muted-foreground">
+      <div className={cn(
+        "flex size-9 shrink-0 items-center justify-center text-muted-foreground",
+        notification.status === "open" && "text-green-600 dark:text-green-400",
+        notification.status === "merged" && "text-violet-600 dark:text-violet-400",
+        notification.status === "closed" && "text-red-600 dark:text-red-400",
+      )} title={notification.status === null ? undefined : `${notification.status[0]?.toUpperCase()}${notification.status.slice(1)}`}>
         <Icon name={icon} className="size-[18px]" />
       </div>
       <div className="min-w-0 flex-1">
@@ -222,17 +225,6 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
           <Badge className="h-4 px-1.5 text-[10px]">
             {typeLabel}
           </Badge>
-          {statusLabel === null ? null : (
-            <Badge className={cn(
-              "h-4 gap-1 px-1.5 text-[10px]",
-              notification.status === "open" && "border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400",
-              notification.status === "merged" && "border-violet-500/25 bg-violet-500/10 text-violet-700 dark:text-violet-400",
-              notification.status === "closed" && "border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400",
-            )}>
-              <Icon name={statusIcon} className="size-2.5" />
-              {statusLabel}
-            </Badge>
-          )}
           <span>{reasonLabels[notification.reason] ?? notification.reason.replaceAll("_", " ")}</span>
         </div>
       </div>
@@ -243,6 +235,11 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
 function NotificationsPage() {
   const { state, error, refreshing, investigatingId, refresh, archive, markRead, investigate, refetch } = useNotifications();
   const [filter, setFilter] = useState<Filter>("all");
+  const [reconnecting, setReconnecting] = useState(false);
+  const handleConnected = useCallback(() => {
+    setReconnecting(false);
+    refetch();
+  }, [refetch]);
   const notifications = useMemo(() => {
     if (state === null || filter === "all") return state?.notifications ?? [];
     return state.notifications.filter((notification) => notification.type === filter);
@@ -253,6 +250,9 @@ function NotificationsPage() {
     issue: state?.notifications.filter((item) => item.type === "issue").length ?? 0,
   }), [state]);
   const unreadCount = state?.notifications.filter((item) => item.unread).length ?? 0;
+  const needsStatusAccess = state?.notifications.some(
+    (item) => (item.type === "pull_request" || item.type === "issue") && item.status === null,
+  ) ?? false;
 
   return (
     <div className="h-full min-h-0 flex-1 overflow-y-auto">
@@ -289,7 +289,21 @@ function NotificationsPage() {
           </div>
         </header>
 
-        {!state?.configured ? <OAuthConnect onConnected={refetch} /> : null}
+        {state?.configured && needsStatusAccess && !reconnecting ? (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-500/25 bg-amber-500/10 px-3.5 py-2.5 text-sm">
+            <p className="text-muted-foreground">Some pull request or issue statuses need additional GitHub repository access.</p>
+            <Button variant="outline" size="sm" onClick={() => setReconnecting(true)}>
+              <Icon name="Github" className="size-4" />
+              Reconnect GitHub
+            </Button>
+          </div>
+        ) : null}
+        {!state?.configured || reconnecting ? <OAuthConnect onConnected={handleConnected} /> : null}
+        {reconnecting ? (
+          <div className="mt-2 text-right">
+            <Button variant="ghost" size="sm" onClick={() => setReconnecting(false)}>Cancel reconnect</Button>
+          </div>
+        ) : null}
         {error !== null ? (
           <div role="alert" className="mt-4 rounded-lg border border-destructive/20 bg-destructive/10 px-3.5 py-2.5 text-sm text-destructive">{error}</div>
         ) : null}
