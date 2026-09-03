@@ -9,6 +9,7 @@ const notificationSchema = z.object({
   title: z.string(),
   type: z.enum(["pull_request", "issue", "other"]),
   status: z.enum(["open", "closed", "merged"]).nullable(),
+  draft: z.boolean().nullable(),
   reason: z.string(),
   url: z.string().url().nullable(),
   unread: z.boolean(),
@@ -83,6 +84,11 @@ type NotificationStatus = Notification["status"];
 const githubSubjectSchema = z.object({
   state: z.enum(["open", "closed"]),
   merged_at: z.string().nullable().optional(),
+  draft: z.boolean().optional(),
+});
+
+const githubReleaseSchema = z.object({
+  html_url: z.string().url(),
 });
 
 type DeviceFlow = {
@@ -189,6 +195,14 @@ export default async function plugin(bb: BbPluginApi) {
     "ALTER TABLE notifications ADD COLUMN status TEXT;",
     "UPDATE sync_state SET etag = NULL;",
     "ALTER TABLE notifications ADD COLUMN status_etag TEXT;",
+    `
+      ALTER TABLE notifications ADD COLUMN subject_url TEXT;
+      UPDATE sync_state SET etag = NULL;
+    `,
+    `
+      ALTER TABLE notifications ADD COLUMN draft INTEGER;
+      UPDATE notifications SET status_etag = NULL;
+    `,
   ]);
 
   let syncInFlight: Promise<void> | null = null;
@@ -197,7 +211,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   function readState(): NotificationState {
     const rows = db.prepare(`
-      SELECT id, repository, repository_url, title, type, status, reason, url, unread,
+      SELECT id, repository, repository_url, title, type, status, draft, reason, url, unread,
              github_updated_at, first_seen_at
       FROM notifications
       WHERE archived_at IS NULL
@@ -211,6 +225,7 @@ export default async function plugin(bb: BbPluginApi) {
       title: String(row.title),
       type: notificationType(String(row.type) === "pull_request" ? "PullRequest" : String(row.type) === "issue" ? "Issue" : "Other"),
       status: notificationStatus(row.status),
+      draft: row.draft === null ? null : row.draft === 1,
       reason: String(row.reason),
       url: row.url === null ? null : String(row.url),
       unread: row.unread === 1,
@@ -239,17 +254,19 @@ export default async function plugin(bb: BbPluginApi) {
 
   const upsert = db.prepare(`
     INSERT INTO notifications (
-      id, repository, repository_url, title, type, status, reason, url, unread,
+      id, repository, repository_url, title, type, status, draft, reason, url, subject_url, unread,
       github_updated_at, first_seen_at, synced_at, archived_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ON CONFLICT(id) DO UPDATE SET
       repository = excluded.repository,
       repository_url = excluded.repository_url,
       title = excluded.title,
       type = excluded.type,
       status = COALESCE(excluded.status, notifications.status),
+      draft = COALESCE(excluded.draft, notifications.draft),
       reason = excluded.reason,
       url = excluded.url,
+      subject_url = excluded.subject_url,
       unread = excluded.unread,
       archived_at = CASE
         WHEN excluded.github_updated_at > notifications.github_updated_at THEN NULL
@@ -270,8 +287,10 @@ export default async function plugin(bb: BbPluginApi) {
         notification.subject.title,
         notificationType(notification.subject.type),
         null,
+        null,
         notification.reason,
         webUrl(notification),
+        notification.subject.url,
         notification.unread ? 1 : 0,
         notification.updated_at,
         now,
@@ -284,6 +303,88 @@ export default async function plugin(bb: BbPluginApi) {
       WHERE id = 1
     `).run(etag, now, pollSeconds);
   });
+
+  async function refreshStoredSubjects(headers: Record<string, string>): Promise<void> {
+    const rows = db.prepare(`
+      SELECT id
+      FROM notifications
+      WHERE archived_at IS NULL
+        AND type = 'other'
+        AND subject_url IS NULL
+        AND url = repository_url
+      LIMIT 500
+    `).all() as Array<{ id: string }>;
+    const updateSubject = db.prepare("UPDATE notifications SET subject_url = ? WHERE id = ?");
+    const failures = new Map<string, number>();
+    const recordFailure = (reason: string) => failures.set(reason, (failures.get(reason) ?? 0) + 1);
+
+    for (let offset = 0; offset < rows.length; offset += 8) {
+      await Promise.all(rows.slice(offset, offset + 8).map(async (row) => {
+        try {
+          const response = await fetch(`https://api.github.com/notifications/threads/${encodeURIComponent(row.id)}`, { headers });
+          if (!response.ok) {
+            recordFailure(`HTTP ${response.status}`);
+            return;
+          }
+          const notification = githubNotificationSchema.parse(await response.json());
+          updateSubject.run(notification.subject.url, row.id);
+        } catch (cause) {
+          recordFailure(cause instanceof z.ZodError ? "invalid response" : "request error");
+        }
+      }));
+    }
+
+    const failed = [...failures.values()].reduce((total, count) => total + count, 0);
+    if (failed > 0) {
+      const summary = [...failures].map(([reason, count]) => `${reason}: ${count}`).join(", ");
+      bb.log.warn(`Could not refresh ${failed} GitHub notification subject${failed === 1 ? "" : "s"} (${summary}).`);
+    }
+  }
+
+  async function refreshReleaseUrls(headers: Record<string, string>): Promise<void> {
+    const rows = db.prepare(`
+      SELECT id, repository, subject_url
+      FROM notifications
+      WHERE archived_at IS NULL
+        AND subject_url IS NOT NULL
+        AND url = repository_url
+        AND subject_url LIKE '%/releases/%'
+      LIMIT 500
+    `).all() as Array<{
+      id: string;
+      repository: string;
+      subject_url: string;
+    }>;
+    const updateUrl = db.prepare("UPDATE notifications SET url = ? WHERE id = ?");
+    const failures = new Map<string, number>();
+    const recordFailure = (reason: string) => failures.set(reason, (failures.get(reason) ?? 0) + 1);
+
+    for (let offset = 0; offset < rows.length; offset += 8) {
+      await Promise.all(rows.slice(offset, offset + 8).map(async (row) => {
+        const releaseId = row.subject_url.match(/\/releases\/(\d+)(?:$|[?#])/)?.[1];
+        if (releaseId === undefined) return;
+        const endpoint = `https://api.github.com/repos/${row.repository}/releases/${releaseId}`;
+
+        try {
+          const response = await fetch(endpoint, { headers });
+          if (!response.ok) {
+            recordFailure(`HTTP ${response.status}`);
+            return;
+          }
+          const release = githubReleaseSchema.parse(await response.json());
+          updateUrl.run(release.html_url, row.id);
+        } catch (cause) {
+          recordFailure(cause instanceof z.ZodError ? "invalid response" : "request error");
+        }
+      }));
+    }
+
+    const failed = [...failures.values()].reduce((total, count) => total + count, 0);
+    if (failed > 0) {
+      const summary = [...failures].map(([reason, count]) => `${reason}: ${count}`).join(", ");
+      bb.log.warn(`Could not resolve ${failed} GitHub release link${failed === 1 ? "" : "s"} (${summary}).`);
+    }
+  }
 
   async function refreshStoredStatuses(headers: Record<string, string>): Promise<void> {
     const rows = db.prepare(`
@@ -298,7 +399,7 @@ export default async function plugin(bb: BbPluginApi) {
       url: string;
       status_etag: string | null;
     }>;
-    const updateStatus = db.prepare("UPDATE notifications SET status = ?, status_etag = ? WHERE id = ?");
+    const updateStatus = db.prepare("UPDATE notifications SET status = ?, draft = ?, status_etag = ? WHERE id = ?");
     const failures = new Map<string, number>();
     const recordFailure = (reason: string) => failures.set(reason, (failures.get(reason) ?? 0) + 1);
 
@@ -321,7 +422,8 @@ export default async function plugin(bb: BbPluginApi) {
           const status: NotificationStatus = row.type === "pull_request" && subject.merged_at
             ? "merged"
             : subject.state;
-          updateStatus.run(status, response.headers.get("etag"), row.id);
+          const draft = row.type === "pull_request" && subject.draft !== undefined ? (subject.draft ? 1 : 0) : null;
+          updateStatus.run(status, draft, response.headers.get("etag"), row.id);
         } catch (cause) {
           recordFailure(cause instanceof z.ZodError ? "invalid response" : "request error");
         }
@@ -362,7 +464,11 @@ export default async function plugin(bb: BbPluginApi) {
         db.prepare("UPDATE sync_state SET last_synced_at = ?, last_error = NULL WHERE id = 1").run(now);
         const detailHeaders = { ...headers };
         delete detailHeaders["If-None-Match"];
-        await refreshStoredStatuses(detailHeaders);
+        await refreshStoredSubjects(detailHeaders);
+        await Promise.all([
+          refreshReleaseUrls(detailHeaders),
+          refreshStoredStatuses(detailHeaders),
+        ]);
         return;
       }
       if (!response.ok) {
@@ -381,7 +487,11 @@ export default async function plugin(bb: BbPluginApi) {
     const detailHeaders = { ...headers };
     delete detailHeaders["If-None-Match"];
     persistSync(notifications, etag, pollSeconds, url === null);
-    await refreshStoredStatuses(detailHeaders);
+    await refreshStoredSubjects(detailHeaders);
+    await Promise.all([
+      refreshReleaseUrls(detailHeaders),
+      refreshStoredStatuses(detailHeaders),
+    ]);
   }
 
   async function syncNow(): Promise<void> {

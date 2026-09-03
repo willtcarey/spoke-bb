@@ -164,6 +164,11 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
   const isIssue = notification.type === "issue";
   const icon = isPullRequest ? "GitPullRequest" : isIssue ? "CircleDot" : "Mail";
   const typeLabel = isPullRequest ? "Pull request" : isIssue ? "Issue" : "Notification";
+  const iconTitle = notification.draft
+    ? "Draft pull request"
+    : notification.status === null
+      ? undefined
+      : `${notification.status[0]?.toUpperCase()}${notification.status.slice(1)}`;
   return (
     <li className={cn(
       "group relative flex gap-3.5 px-4 py-3 transition-colors hover:bg-state-hover/60",
@@ -174,10 +179,10 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
       ) : null}
       <div className={cn(
         "flex size-9 shrink-0 items-center justify-center text-muted-foreground",
-        notification.status === "open" && "text-green-600 dark:text-green-400",
-        notification.status === "merged" && "text-violet-600 dark:text-violet-400",
-        notification.status === "closed" && "text-red-600 dark:text-red-400",
-      )} title={notification.status === null ? undefined : `${notification.status[0]?.toUpperCase()}${notification.status.slice(1)}`}>
+        !notification.draft && notification.status === "open" && "text-green-600 dark:text-green-400",
+        !notification.draft && notification.status === "merged" && "text-violet-600 dark:text-violet-400",
+        !notification.draft && notification.status === "closed" && "text-red-600 dark:text-red-400",
+      )} title={iconTitle}>
         <Icon name={icon} className="size-[18px]" />
       </div>
       <div className="min-w-0 flex-1">
@@ -225,6 +230,7 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
           <Badge className="h-4 px-1.5 text-[10px]">
             {typeLabel}
           </Badge>
+          {notification.draft ? <Badge className="h-4 px-1.5 text-[10px] text-muted-foreground">Draft</Badge> : null}
           <span>{reasonLabels[notification.reason] ?? notification.reason.replaceAll("_", " ")}</span>
         </div>
       </div>
