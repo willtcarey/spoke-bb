@@ -71,6 +71,63 @@ describe("GitHub release links", () => {
   });
 });
 
+describe("pull request reviews", () => {
+  it("lets BB resolve the matched project's remembered execution defaults", async () => {
+    const notification = githubNotification("pr-review", "PullRequest");
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("https://api.github.com/notifications?")) {
+        return Response.json([notification]);
+      }
+      return Response.json({ state: "open", merged_at: null, draft: false });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "github-notifications",
+      settings: { token: "github-token" },
+      sdk: {
+        projects: {
+          list: async () => [{
+            id: "integrity-finance",
+            gitRemoteUrl: "git@github.com:acme/widgets.git",
+          }],
+        },
+        threads: {
+          spawn: async () => ({ id: "review-thread" }),
+        },
+      },
+    });
+    await plugin(bb);
+    await harness.behavior.callRpc("notifications_sync", null);
+
+    await expect(harness.behavior.callRpc("notifications_investigate", { id: "pr-review" })).resolves.toEqual({
+      threadId: "review-thread",
+      projectId: "integrity-finance",
+    });
+    expect(harness.sdk.callsTo("threads.spawn")).toEqual([[
+      {
+        projectId: "integrity-finance",
+        environment: { type: "project-default" },
+        title: "Review PR: Ship the feature",
+        prompt: [
+          "Review this GitHub pull request notification: https://github.com/acme/widgets/pull/12",
+          "Repository: acme/widgets",
+          "Title: Ship the feature",
+          "Inspect the pull request, its changes, discussion, review state, and CI status. Summarize what needs attention, identify risks or blockers, and recommend the next action. Do not modify code unless I ask you to after the investigation.",
+        ].join("\n\n"),
+        origin: "plugin",
+        originPluginId: "github-notifications",
+      },
+    ]]);
+    expect(harness.sdk.callsTo("projects.defaultExecutionOptions")).toEqual([]);
+    expect(harness.sdk.callsTo("providers.list")).toEqual([]);
+    expect(harness.sdk.callsTo("providers.models")).toEqual([]);
+
+    await harness.lifecycle.dispose();
+  });
+});
+
 describe("GitHub subject status sync", () => {
   it("refreshes stored pull request and issue statuses when the notifications feed is unchanged", async () => {
     const notifications = [githubNotification("pr-1", "PullRequest"), githubNotification("issue-1", "Issue")];

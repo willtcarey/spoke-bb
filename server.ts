@@ -562,51 +562,9 @@ export default async function plugin(bb: BbPluginApi) {
       throw new Error(`No BB project has a GitHub remote for ${notification.repository}. Add the repository as a project first.`);
     }
 
-    const defaults = await bb.sdk.projects.defaultExecutionOptions({ projectId: project.id });
-    const hostId = project.sources.find((source) => source.isDefault)?.hostId ?? project.sources[0]?.hostId;
-    const providers = await bb.sdk.providers.list(hostId === undefined ? {} : { hostId });
-    const candidates = [
-      ...providers.filter((provider) => provider.id === defaults?.providerId),
-      ...providers.filter((provider) => provider.id !== defaults?.providerId),
-    ];
-
-    let execution: { providerId: string; model: string; reasoningLevel: NonNullable<typeof defaults>["reasoningLevel"] } | null = null;
-    for (const provider of candidates) {
-      if (!provider.available || provider.capabilities.modelCatalogScope !== "host") continue;
-      try {
-        const catalog = hostId === undefined
-          ? await bb.sdk.providers.models({ providerId: provider.id })
-          : await bb.sdk.providers.models({ providerId: provider.id, hostId });
-        const preferredModel = provider.id === defaults?.providerId
-          ? catalog.models.find((model) => model.model === defaults.model || model.id === defaults.model)
-          : undefined;
-        const model = preferredModel ?? catalog.models.find((candidate) => candidate.isDefault) ?? catalog.models[0];
-        if (model === undefined) continue;
-        const supportedReasoning = model.supportedReasoningEfforts.map((effort) => effort.reasoningEffort);
-        const reasoningLevel = provider.id === defaults?.providerId && supportedReasoning.includes(defaults.reasoningLevel)
-          ? defaults.reasoningLevel
-          : model.defaultReasoningEffort;
-        execution = { providerId: provider.id, model: model.model, reasoningLevel };
-        break;
-      } catch (cause) {
-        bb.log.warn(`Could not load ${provider.displayName} models for PR review: ${cause instanceof Error ? cause.message : String(cause)}`);
-      }
-    }
-    if (execution === null) {
-      throw new Error("No agent provider with available models can start this review. Connect a provider on the project's machine and try again.");
-    }
-
     const thread = await bb.sdk.threads.spawn({
       projectId: project.id,
       environment: { type: "project-default" },
-      providerId: execution.providerId,
-      model: execution.model,
-      reasoningLevel: execution.reasoningLevel,
-      executionInputSources: {
-        providerId: "explicit",
-        model: "explicit",
-        reasoningLevel: "explicit",
-      },
       title: `Review PR: ${notification.title}`,
       prompt: [
         `Review this GitHub pull request notification: ${notification.url}`,
