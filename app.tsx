@@ -161,7 +161,7 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
   investigating: boolean;
 }) {
   const navigate = useBbNavigate();
-  const reviewThreadId = notification.reviewThreadId;
+  const reviewThreadId = notification.reviewThreadId ?? null;
   const isPullRequest = notification.type === "pull_request";
   const isIssue = notification.type === "issue";
   const icon = isPullRequest ? "GitPullRequest" : isIssue ? "CircleDot" : "Mail";
