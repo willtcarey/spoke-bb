@@ -15,6 +15,7 @@ const notificationSchema = z.object({
   unread: z.boolean(),
   updatedAt: z.string(),
   firstSeenAt: z.string(),
+  reviewThreadId: z.string().nullable(),
 });
 export type Notification = z.infer<typeof notificationSchema>;
 
@@ -41,7 +42,7 @@ export const rpcContract = defineRpcContract({
   notifications_sync: { input: z.null(), output: stateSchema },
   notifications_investigate: {
     input: z.object({ id: z.string().min(1).max(100) }).strict(),
-    output: z.object({ threadId: z.string(), projectId: z.string() }),
+    output: z.object({ threadId: z.string() }),
   },
   oauth_start: {
     input: z.null(),
@@ -71,6 +72,7 @@ const githubNotificationSchema = z.object({
   subject: z.object({
     title: z.string(),
     url: z.string().nullable(),
+    latest_comment_url: z.string().url().nullable().optional(),
     type: z.string(),
   }),
   repository: z.object({
@@ -90,6 +92,11 @@ const githubSubjectSchema = z.object({
 const githubReleaseSchema = z.object({
   html_url: z.string().url(),
 });
+
+const githubTimelineSchema = z.array(z.object({
+  event: z.string().optional(),
+  created_at: z.string().optional(),
+}).passthrough());
 
 type DeviceFlow = {
   deviceCode: string;
@@ -121,13 +128,17 @@ function webUrl(notification: GithubNotification): string | null {
   return `${notification.repository.html_url}/${segment}/${number}`;
 }
 
-function nextPage(link: string | null): string | null {
+function linkedPage(link: string | null, relation: "next" | "last"): string | null {
   if (link === null) return null;
   for (const part of link.split(",")) {
-    const match = part.match(/<([^>]+)>;\s*rel="next"/);
+    const match = part.match(new RegExp(`<([^>]+)>;\\s*rel="${relation}"`));
     if (match?.[1] !== undefined) return match[1];
   }
   return null;
+}
+
+function nextPage(link: string | null): string | null {
+  return linkedPage(link, "next");
 }
 
 function githubRepositorySlug(remoteUrl: string | null): string | null {
@@ -203,6 +214,15 @@ export default async function plugin(bb: BbPluginApi) {
       ALTER TABLE notifications ADD COLUMN draft INTEGER;
       UPDATE notifications SET status_etag = NULL;
     `,
+    "ALTER TABLE notifications ADD COLUMN review_thread_id TEXT;",
+    `
+      ALTER TABLE notifications ADD COLUMN latest_comment_url TEXT;
+      ALTER TABLE notifications ADD COLUMN archived_latest_comment_url TEXT;
+      ALTER TABLE notifications ADD COLUMN archived_github_updated_at TEXT;
+      UPDATE notifications
+      SET archived_github_updated_at = github_updated_at
+      WHERE archived_at IS NOT NULL;
+    `,
   ]);
 
   let syncInFlight: Promise<void> | null = null;
@@ -212,7 +232,7 @@ export default async function plugin(bb: BbPluginApi) {
   function readState(): NotificationState {
     const rows = db.prepare(`
       SELECT id, repository, repository_url, title, type, status, draft, reason, url, unread,
-             github_updated_at, first_seen_at
+             github_updated_at, first_seen_at, review_thread_id
       FROM notifications
       WHERE archived_at IS NULL
       ORDER BY github_updated_at DESC
@@ -231,6 +251,7 @@ export default async function plugin(bb: BbPluginApi) {
       unread: row.unread === 1,
       updatedAt: String(row.github_updated_at),
       firstSeenAt: String(row.first_seen_at),
+      reviewThreadId: row.review_thread_id === null ? null : String(row.review_thread_id),
     }));
     const counts = db.prepare(`
       SELECT
@@ -254,9 +275,9 @@ export default async function plugin(bb: BbPluginApi) {
 
   const upsert = db.prepare(`
     INSERT INTO notifications (
-      id, repository, repository_url, title, type, status, draft, reason, url, subject_url, unread,
-      github_updated_at, first_seen_at, synced_at, archived_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      id, repository, repository_url, title, type, status, draft, reason, url, subject_url,
+      latest_comment_url, unread, github_updated_at, first_seen_at, synced_at, archived_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
     ON CONFLICT(id) DO UPDATE SET
       repository = excluded.repository,
       repository_url = excluded.repository_url,
@@ -267,9 +288,11 @@ export default async function plugin(bb: BbPluginApi) {
       reason = excluded.reason,
       url = excluded.url,
       subject_url = excluded.subject_url,
+      latest_comment_url = excluded.latest_comment_url,
       unread = excluded.unread,
       archived_at = CASE
-        WHEN excluded.github_updated_at > notifications.github_updated_at THEN NULL
+        WHEN excluded.github_updated_at > notifications.github_updated_at
+          AND notifications.type <> 'pull_request' THEN NULL
         ELSE notifications.archived_at
       END,
       github_updated_at = excluded.github_updated_at,
@@ -291,6 +314,7 @@ export default async function plugin(bb: BbPluginApi) {
         notification.reason,
         webUrl(notification),
         notification.subject.url,
+        notification.subject.latest_comment_url ?? null,
         notification.unread ? 1 : 0,
         notification.updated_at,
         now,
@@ -437,6 +461,54 @@ export default async function plugin(bb: BbPluginApi) {
     }
   }
 
+  async function resurfaceArchivedPullRequests(headers: Record<string, string>): Promise<void> {
+    const rows = db.prepare(`
+      SELECT id, repository, url, reason, archived_github_updated_at,
+             latest_comment_url, archived_latest_comment_url
+      FROM notifications
+      WHERE archived_at IS NOT NULL
+        AND type = 'pull_request'
+        AND github_updated_at > archived_github_updated_at
+      LIMIT 500
+    `).all() as Array<{
+      id: string;
+      repository: string;
+      url: string | null;
+      reason: string;
+      archived_github_updated_at: string;
+      latest_comment_url: string | null;
+      archived_latest_comment_url: string | null;
+    }>;
+    const resurface = db.prepare("UPDATE notifications SET archived_at = NULL WHERE id = ?");
+
+    for (const row of rows) {
+      if (row.latest_comment_url !== null && row.latest_comment_url !== row.archived_latest_comment_url) {
+        resurface.run(row.id);
+        continue;
+      }
+      if (row.reason !== "review_requested" || row.url === null) continue;
+
+      const number = row.url.match(/\/pull\/(\d+)(?:$|[?#])/)?.[1];
+      if (number === undefined) continue;
+      try {
+        let response = await fetch(
+          `https://api.github.com/repos/${row.repository}/issues/${number}/timeline?per_page=100`,
+          { headers },
+        );
+        if (!response.ok) continue;
+        const lastUrl = linkedPage(response.headers.get("link"), "last");
+        if (lastUrl !== null) response = await fetch(lastUrl, { headers });
+        if (!response.ok) continue;
+        const events = githubTimelineSchema.parse(await response.json());
+        if (events.some((event) => event.event === "review_requested" && event.created_at !== undefined && event.created_at > row.archived_github_updated_at)) {
+          resurface.run(row.id);
+        }
+      } catch (cause) {
+        bb.log.warn(`Could not inspect activity for GitHub notification ${row.id}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      }
+    }
+  }
+
   async function performSync(): Promise<void> {
     const { token } = await settings.get();
     if (!token) throw new Error("Configure a GitHub personal access token first.");
@@ -491,6 +563,7 @@ export default async function plugin(bb: BbPluginApi) {
     await Promise.all([
       refreshReleaseUrls(detailHeaders),
       refreshStoredStatuses(detailHeaders),
+      resurfaceArchivedPullRequests(detailHeaders),
     ]);
   }
 
@@ -545,15 +618,22 @@ export default async function plugin(bb: BbPluginApi) {
 
   async function investigateNotification(id: string) {
     const notification = db.prepare(`
-      SELECT repository, title, type, url
+      SELECT repository, title, type, url, review_thread_id
       FROM notifications
       WHERE id = ? AND archived_at IS NULL
-    `).get(id) as { repository: string; title: string; type: string; url: string | null } | undefined;
+    `).get(id) as {
+      repository: string;
+      title: string;
+      type: string;
+      url: string | null;
+      review_thread_id: string | null;
+    } | undefined;
 
     if (notification === undefined) throw new Error("That notification is no longer in the inbox.");
     if (notification.type !== "pull_request" || notification.url === null) {
       throw new Error("Only pull request notifications can be investigated.");
     }
+    if (notification.review_thread_id !== null) return { threadId: notification.review_thread_id };
 
     const repository = notification.repository.toLowerCase();
     const projects = await bb.sdk.projects.list();
@@ -574,7 +654,10 @@ export default async function plugin(bb: BbPluginApi) {
       ].join("\n\n"),
     });
 
-    return { threadId: thread.id, projectId: project.id };
+    db.prepare("UPDATE notifications SET review_thread_id = ? WHERE id = ?").run(thread.id, id);
+    bb.realtime.publish(NOTIFICATIONS_CHANGED, { reviewThreadId: thread.id, notificationId: id });
+
+    return { threadId: thread.id };
   }
 
   async function startDeviceFlow() {
@@ -686,7 +769,11 @@ export default async function plugin(bb: BbPluginApi) {
     notifications_state: () => readState(),
     notifications_archive: ({ id }) => {
       const result = db.prepare(`
-        UPDATE notifications SET archived_at = ? WHERE id = ? AND archived_at IS NULL
+        UPDATE notifications
+        SET archived_at = ?,
+            archived_latest_comment_url = latest_comment_url,
+            archived_github_updated_at = github_updated_at
+        WHERE id = ? AND archived_at IS NULL
       `).run(new Date().toISOString(), id);
       const archived = result.changes > 0;
       if (archived) bb.realtime.publish(NOTIFICATIONS_CHANGED, { archived: id });

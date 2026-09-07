@@ -7,8 +7,8 @@ A sidebar inbox for GitHub activity that needs your attention.
 - Stores the inbox in plugin-owned SQLite, so opening the page only reads local data.
 - Separates pull request and issue counts in the sidebar.
 - Preserves notifications locally after GitHub marks them read.
-- Archives notifications locally; newer GitHub activity automatically resurfaces an archived thread.
-- Starts a review thread from a pull request notification in the BB project whose GitHub remote matches the repository.
+- Archives notifications locally; issues resurface for newer activity, while pull requests stay hidden for commit-only updates and resurface for new comments or review requests.
+- Starts a review thread from a pull request notification in the BB project whose GitHub remote matches the repository, then links back to that thread on later visits.
 - Uses ETags and GitHub's `X-Poll-Interval` guidance to avoid unnecessary API requests.
 
 ## Configure

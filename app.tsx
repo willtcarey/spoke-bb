@@ -160,6 +160,8 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
   investigate: () => void;
   investigating: boolean;
 }) {
+  const navigate = useBbNavigate();
+  const reviewThreadId = notification.reviewThreadId;
   const isPullRequest = notification.type === "pull_request";
   const isIssue = notification.type === "issue";
   const icon = isPullRequest ? "GitPullRequest" : isIssue ? "CircleDot" : "Mail";
@@ -206,9 +208,11 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
               size="sm"
               className="h-7 shrink-0 px-2"
               disabled={investigating}
-              onClick={investigate}
+              onClick={reviewThreadId === null
+                ? investigate
+                : () => navigate.toThread(reviewThreadId)}
             >
-              {investigating ? "Starting…" : "Review"}
+              {investigating ? "Starting…" : reviewThreadId === null ? "Review" : "Open review"}
             </Button>
           ) : null}
           <Button

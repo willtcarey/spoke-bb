@@ -72,6 +72,57 @@ describe("GitHub release links", () => {
 });
 
 describe("pull request reviews", () => {
+  it("keeps archived pull requests hidden for commits and resurfaces them for comments or review requests", async () => {
+    let notification = {
+      ...githubNotification("pr-activity", "PullRequest"),
+      reason: "review_requested",
+      subject: {
+        ...githubNotification("pr-activity", "PullRequest").subject,
+        latest_comment_url: null as string | null,
+      },
+    };
+    let timeline = [{ event: "review_requested", created_at: "2025-01-01T00:00:00Z" }];
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("https://api.github.com/notifications?")) return Response.json([notification]);
+      if (url.includes("/issues/12/timeline")) return Response.json(timeline);
+      return Response.json({ state: "open", merged_at: null, draft: false });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "github-notifications",
+      settings: { token: "github-token" },
+    });
+    await plugin(bb);
+    await harness.behavior.callRpc("notifications_sync", null);
+    await harness.behavior.callRpc("notifications_archive", { id: "pr-activity" });
+
+    notification = { ...notification, updated_at: "2099-01-01T00:00:00Z" };
+    let state = await harness.behavior.callRpc("notifications_sync", null) as NotificationState;
+    expect(state.notifications).toEqual([]);
+
+    notification = {
+      ...notification,
+      reason: "comment",
+      updated_at: "2099-01-02T00:00:00Z",
+      subject: {
+        ...notification.subject,
+        latest_comment_url: "https://api.github.com/repos/acme/widgets/issues/comments/99",
+      },
+    };
+    state = await harness.behavior.callRpc("notifications_sync", null) as NotificationState;
+    expect(state.notifications.map(({ id }) => id)).toEqual(["pr-activity"]);
+
+    await harness.behavior.callRpc("notifications_archive", { id: "pr-activity" });
+    notification = { ...notification, reason: "review_requested", updated_at: "2099-01-03T00:00:00Z" };
+    timeline = [...timeline, { event: "review_requested", created_at: "2099-01-03T00:00:00Z" }];
+    state = await harness.behavior.callRpc("notifications_sync", null) as NotificationState;
+    expect(state.notifications.map(({ id }) => id)).toEqual(["pr-activity"]);
+
+    await harness.lifecycle.dispose();
+  });
+
   it("lets BB resolve the matched project's remembered execution defaults", async () => {
     const notification = githubNotification("pr-review", "PullRequest");
     const fetchMock = vi.fn(async (input: string | URL | Request) => {
@@ -103,8 +154,12 @@ describe("pull request reviews", () => {
 
     await expect(harness.behavior.callRpc("notifications_investigate", { id: "pr-review" })).resolves.toEqual({
       threadId: "review-thread",
-      projectId: "integrity-finance",
     });
+    await expect(harness.behavior.callRpc("notifications_investigate", { id: "pr-review" })).resolves.toEqual({
+      threadId: "review-thread",
+    });
+    const state = await harness.behavior.callRpc("notifications_state", null) as NotificationState;
+    expect(state.notifications[0]?.reviewThreadId).toBe("review-thread");
     expect(harness.sdk.callsTo("threads.spawn")).toEqual([[
       {
         projectId: "integrity-finance",
