@@ -195,6 +195,7 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
             ) : (
               <UrlLink
                 href={notification.url}
+                target="_blank"
                 className={cn("leading-5 decoration-primary/50 underline-offset-2 hover:text-primary hover:underline", notification.unread ? "font-semibold" : "font-medium")}
                 onClick={notification.unread ? markRead : undefined}
               >
@@ -226,7 +227,11 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
           </Button>
         </div>
         <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
-          <UrlLink href={notification.repositoryUrl} className="max-w-64 truncate font-medium text-foreground/70 hover:text-primary hover:underline">
+          <UrlLink
+            href={notification.repositoryUrl}
+            target="_blank"
+            className="max-w-64 truncate font-medium text-foreground/70 hover:text-primary hover:underline"
+          >
             {notification.repository}
           </UrlLink>
           <span className="text-border" aria-hidden="true">/</span>
