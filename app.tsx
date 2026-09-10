@@ -15,6 +15,7 @@ import { Icon } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 
 type Filter = "all" | Notification["type"];
+type Grouping = "none" | "project";
 
 function useNotifications() {
   const rpc = useRpc<typeof rpcContract>();
@@ -173,14 +174,14 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
       : `${notification.status[0]?.toUpperCase()}${notification.status.slice(1)}`;
   return (
     <li className={cn(
-      "group relative flex gap-3.5 px-4 py-3 transition-colors hover:bg-state-hover/60",
+      "group relative flex gap-2.5 px-3 py-2 transition-colors hover:bg-state-hover/60",
       notification.unread && "bg-blue-500/10 hover:bg-blue-500/15",
     )}>
       {notification.unread ? (
-        <span className="absolute inset-y-3 left-0 w-0.5 rounded-r-full bg-blue-500" aria-hidden="true" />
+        <span className="absolute inset-y-2 left-0 w-0.5 rounded-r-full bg-blue-500" aria-hidden="true" />
       ) : null}
       <div className={cn(
-        "flex size-9 shrink-0 items-center justify-center text-muted-foreground",
+        "flex size-7 shrink-0 items-center justify-center text-muted-foreground",
         !notification.draft && notification.status === "open" && "text-green-600 dark:text-green-400",
         !notification.draft && notification.status === "merged" && "text-violet-600 dark:text-violet-400",
         !notification.draft && notification.status === "closed" && "text-red-600 dark:text-red-400",
@@ -189,7 +190,7 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-start gap-2">
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1 pt-0.5">
             {notification.url === null ? (
               <span className={cn("leading-5", notification.unread ? "font-semibold" : "font-medium")}>{notification.title}</span>
             ) : (
@@ -238,7 +239,7 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
             <Icon name="Archive" className="size-4" />
           </Button>
         </div>
-        <div className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs leading-4 text-muted-foreground">
           <UrlLink
             href={notification.repositoryUrl}
             target="_blank"
@@ -262,6 +263,7 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
 function NotificationsPage() {
   const { state, error, refreshing, investigatingId, refresh, archive, markRead, investigate, refetch } = useNotifications();
   const [filter, setFilter] = useState<Filter>("all");
+  const [grouping, setGrouping] = useState<Grouping>("none");
   const [reconnecting, setReconnecting] = useState(false);
   const handleConnected = useCallback(() => {
     setReconnecting(false);
@@ -271,6 +273,18 @@ function NotificationsPage() {
     if (state === null || filter === "all") return state?.notifications ?? [];
     return state.notifications.filter((notification) => notification.type === filter);
   }, [filter, state]);
+  const groups = useMemo(() => {
+    if (grouping === "none") return [{ name: null, notifications }];
+    const repositories = new Map<string, Notification[]>();
+    for (const notification of notifications) {
+      const items = repositories.get(notification.repository) ?? [];
+      items.push(notification);
+      repositories.set(notification.repository, items);
+    }
+    return [...repositories.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([name, notifications]) => ({ name, notifications }));
+  }, [grouping, notifications]);
   const filterCounts = useMemo(() => ({
     all: state?.notifications.length ?? 0,
     pull_request: state?.notifications.filter((item) => item.type === "pull_request").length ?? 0,
@@ -361,9 +375,25 @@ function NotificationsPage() {
               </Button>
             ))}
           </div>
-          {state?.lastSyncedAt ? (
-            <p className="text-xs text-muted-foreground">Updated {relativeTime(state.lastSyncedAt)}</p>
-          ) : null}
+          <div className="flex flex-wrap items-center gap-3">
+            {state?.lastSyncedAt ? (
+              <p className="text-xs text-muted-foreground">Updated {relativeTime(state.lastSyncedAt)}</p>
+            ) : null}
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              Group by
+              <select
+                className="h-9 rounded-md border border-border bg-card px-2 text-sm text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                value={grouping}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  if (value === "none" || value === "project") setGrouping(value);
+                }}
+              >
+                <option value="none">None</option>
+                <option value="project">Project</option>
+              </select>
+            </label>
+          </div>
         </div>
 
         <div className="mt-3">
@@ -374,8 +404,17 @@ function NotificationsPage() {
               {state.notifications.length === 0 ? "You’re all caught up. Nothing needs your attention." : "No notifications match this filter."}
             </InboxEmptyState>
           ) : (
-            <ul className="divide-y divide-border overflow-hidden rounded-xl border border-border bg-card shadow-sm">
-              {notifications.map((notification) => (
+            <div className="space-y-4">
+              {groups.map((group) => (
+                <section key={group.name ?? "ungrouped"} className="overflow-hidden rounded-xl border border-border bg-card shadow-sm">
+                  {group.name !== null ? (
+                    <h2 className="flex items-center justify-between gap-3 border-b border-border bg-secondary/50 px-4 py-2.5 text-sm font-semibold">
+                      <span className="min-w-0 break-all">{group.name}</span>
+                      <Badge>{group.notifications.length}</Badge>
+                    </h2>
+                  ) : null}
+                  <ul className="divide-y divide-border">
+              {group.notifications.map((notification) => (
                 <NotificationRow
                   key={notification.id}
                   notification={notification}
@@ -385,7 +424,10 @@ function NotificationsPage() {
                   investigating={investigatingId === notification.id}
                 />
               ))}
-            </ul>
+                  </ul>
+                </section>
+              ))}
+            </div>
           )}
         </div>
       </div>
