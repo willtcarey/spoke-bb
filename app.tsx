@@ -216,6 +216,18 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
               {investigating ? "Starting…" : reviewThreadId === null ? "Review" : "Open review"}
             </Button>
           ) : null}
+          <div className="flex h-7 w-[21px] shrink-0 items-center justify-center">
+            {notification.avatarUrl ? (
+              <img
+                src={notification.avatarUrl}
+                alt="GitHub user avatar"
+                className="size-[21px] rounded-full object-cover"
+                loading="lazy"
+                referrerPolicy="no-referrer"
+                onError={(event) => { event.currentTarget.style.display = "none"; }}
+              />
+            ) : null}
+          </div>
           <Button
             variant="ghost"
             size="icon"

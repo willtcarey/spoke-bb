@@ -16,6 +16,7 @@ const notificationSchema = z.object({
   updatedAt: z.string(),
   firstSeenAt: z.string(),
   reviewThreadId: z.string().nullable(),
+  avatarUrl: z.string().url().nullable(),
 });
 export type Notification = z.infer<typeof notificationSchema>;
 
@@ -84,6 +85,7 @@ type GithubNotification = z.infer<typeof githubNotificationSchema>;
 type NotificationStatus = Notification["status"];
 
 const githubSubjectSchema = z.object({
+  user: z.object({ avatar_url: z.string().url().nullable().optional() }).nullable().optional(),
   state: z.enum(["open", "closed"]),
   merged_at: z.string().nullable().optional(),
   draft: z.boolean().optional(),
@@ -223,6 +225,10 @@ export default async function plugin(bb: BbPluginApi) {
       SET archived_github_updated_at = github_updated_at
       WHERE archived_at IS NOT NULL;
     `,
+    `
+      ALTER TABLE notifications ADD COLUMN avatar_url TEXT;
+      UPDATE notifications SET status_etag = NULL;
+    `,
   ]);
 
   let syncInFlight: Promise<void> | null = null;
@@ -232,7 +238,7 @@ export default async function plugin(bb: BbPluginApi) {
   function readState(): NotificationState {
     const rows = db.prepare(`
       SELECT id, repository, repository_url, title, type, status, draft, reason, url, unread,
-             github_updated_at, first_seen_at, review_thread_id
+             github_updated_at, first_seen_at, review_thread_id, avatar_url
       FROM notifications
       WHERE archived_at IS NULL
       ORDER BY github_updated_at DESC
@@ -252,6 +258,7 @@ export default async function plugin(bb: BbPluginApi) {
       updatedAt: String(row.github_updated_at),
       firstSeenAt: String(row.first_seen_at),
       reviewThreadId: row.review_thread_id === null ? null : String(row.review_thread_id),
+      avatarUrl: row.avatar_url === null ? null : String(row.avatar_url),
     }));
     const counts = db.prepare(`
       SELECT
@@ -423,7 +430,7 @@ export default async function plugin(bb: BbPluginApi) {
       url: string;
       status_etag: string | null;
     }>;
-    const updateStatus = db.prepare("UPDATE notifications SET status = ?, draft = ?, status_etag = ? WHERE id = ?");
+    const updateStatus = db.prepare("UPDATE notifications SET status = ?, draft = ?, status_etag = ?, avatar_url = ? WHERE id = ?");
     const failures = new Map<string, number>();
     const recordFailure = (reason: string) => failures.set(reason, (failures.get(reason) ?? 0) + 1);
 
@@ -447,7 +454,7 @@ export default async function plugin(bb: BbPluginApi) {
             ? "merged"
             : subject.state;
           const draft = row.type === "pull_request" && subject.draft !== undefined ? (subject.draft ? 1 : 0) : null;
-          updateStatus.run(status, draft, response.headers.get("etag"), row.id);
+          updateStatus.run(status, draft, response.headers.get("etag"), subject.user?.avatar_url ?? null, row.id);
         } catch (cause) {
           recordFailure(cause instanceof z.ZodError ? "invalid response" : "request error");
         }
