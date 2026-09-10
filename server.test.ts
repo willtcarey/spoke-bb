@@ -72,6 +72,74 @@ describe("GitHub release links", () => {
 });
 
 describe("pull request reviews", () => {
+  it("resurfaces any newer author notification but keeps unchanged notifications archived", async () => {
+    let notification = {
+      ...githubNotification("author-update", "PullRequest"),
+      reason: "author",
+      subject: { ...githubNotification("author-update", "PullRequest").subject, latest_comment_url: null },
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("https://api.github.com/notifications?")) return Response.json([notification]);
+      if (url.includes("/timeline")) return Response.json([]);
+      return Response.json({ state: "open", merged_at: null, draft: false });
+    }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "github-notifications",
+      settings: { token: "github-token" },
+    });
+    await plugin(bb);
+    await harness.behavior.callRpc("notifications_sync", null);
+    await harness.behavior.callRpc("notifications_archive", { id: "author-update" });
+
+    let state = await harness.behavior.callRpc("notifications_sync", null) as NotificationState;
+    expect(state.notifications).toEqual([]);
+
+    notification = { ...notification, unread: false, updated_at: "2099-01-01T00:00:00Z" };
+    state = await harness.behavior.callRpc("notifications_sync", null) as NotificationState;
+    expect(state.notifications.map(({ id }) => id)).toEqual(["author-update"]);
+
+    await harness.behavior.callRpc("notifications_archive", { id: "author-update" });
+    state = await harness.behavior.callRpc("notifications_sync", null) as NotificationState;
+    expect(state.notifications).toEqual([]);
+    await harness.lifecycle.dispose();
+  });
+
+  it.each(["approved", "changes_requested", "commented"])("resurfaces a subscribed archived PR for a %s review without a comment URL", async (reviewState) => {
+    let notification = {
+      ...githubNotification("author-pr", "PullRequest"),
+      reason: "subscribed",
+      subject: { ...githubNotification("author-pr", "PullRequest").subject, latest_comment_url: null },
+    };
+    let submittedAt = "2024-12-31T00:00:00Z";
+    vi.stubGlobal("fetch", vi.fn(async (input: string | URL | Request) => {
+      const url = String(input);
+      if (url.startsWith("https://api.github.com/notifications?")) return Response.json([notification]);
+      if (url.includes("/issues/12/timeline")) return Response.json([
+        { event: "reviewed", state: reviewState, submitted_at: submittedAt },
+        { event: "committed", created_at: "2099-01-01T00:00:00Z" },
+      ]);
+      return Response.json({ state: "open", merged_at: null, draft: false });
+    }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "github-notifications",
+      settings: { token: "github-token" },
+    });
+    await plugin(bb);
+    await harness.behavior.callRpc("notifications_sync", null);
+    await harness.behavior.callRpc("notifications_archive", { id: "author-pr" });
+
+    notification = { ...notification, unread: false, updated_at: "2099-01-01T00:00:00Z" };
+    let state = await harness.behavior.callRpc("notifications_sync", null) as NotificationState;
+    expect(state.notifications).toEqual([]);
+
+    submittedAt = "2099-01-02T00:00:00Z";
+    notification = { ...notification, updated_at: submittedAt };
+    state = await harness.behavior.callRpc("notifications_sync", null) as NotificationState;
+    expect(state.notifications.map(({ id }) => id)).toEqual(["author-pr"]);
+    await harness.lifecycle.dispose();
+  });
+
   it("keeps archived pull requests hidden for commits and resurfaces them for comments or review requests", async () => {
     let notification = {
       ...githubNotification("pr-activity", "PullRequest"),

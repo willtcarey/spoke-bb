@@ -97,7 +97,8 @@ const githubReleaseSchema = z.object({
 
 const githubTimelineSchema = z.array(z.object({
   event: z.string().optional(),
-  created_at: z.string().optional(),
+  created_at: z.string().nullable().optional(),
+  submitted_at: z.string().nullable().optional(),
 }).passthrough());
 
 type DeviceFlow = {
@@ -489,11 +490,11 @@ export default async function plugin(bb: BbPluginApi) {
     const resurface = db.prepare("UPDATE notifications SET archived_at = NULL WHERE id = ?");
 
     for (const row of rows) {
-      if (row.latest_comment_url !== null && row.latest_comment_url !== row.archived_latest_comment_url) {
+      if (row.reason === "author" || (row.latest_comment_url !== null && row.latest_comment_url !== row.archived_latest_comment_url)) {
         resurface.run(row.id);
         continue;
       }
-      if (row.reason !== "review_requested" || row.url === null) continue;
+      if (row.url === null) continue;
 
       const number = row.url.match(/\/pull\/(\d+)(?:$|[?#])/)?.[1];
       if (number === undefined) continue;
@@ -507,7 +508,13 @@ export default async function plugin(bb: BbPluginApi) {
         if (lastUrl !== null) response = await fetch(lastUrl, { headers });
         if (!response.ok) continue;
         const events = githubTimelineSchema.parse(await response.json());
-        if (events.some((event) => event.event === "review_requested" && event.created_at !== undefined && event.created_at > row.archived_github_updated_at)) {
+        if (events.some((event) => {
+          // Submitted reviews do not reliably populate latest_comment_url, and
+          // author notifications retain their reason when a review arrives.
+          const activityAt = event.event === "reviewed" ? event.submitted_at
+            : event.event === "review_requested" ? event.created_at : null;
+          return activityAt != null && activityAt > row.archived_github_updated_at;
+        })) {
           resurface.run(row.id);
         }
       } catch (cause) {
