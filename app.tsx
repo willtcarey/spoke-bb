@@ -16,6 +16,7 @@ import { cn } from "@/lib/utils";
 
 type Filter = "all" | Notification["type"];
 type Grouping = "none" | "project";
+const groupingStorageKey = "spoke:notifications:grouping";
 
 function useNotifications() {
   const rpc = useRpc<typeof rpcContract>();
@@ -263,7 +264,20 @@ function NotificationRow({ notification, archive, markRead, investigate, investi
 function NotificationsPage() {
   const { state, error, refreshing, investigatingId, refresh, archive, markRead, investigate, refetch } = useNotifications();
   const [filter, setFilter] = useState<Filter>("all");
-  const [grouping, setGrouping] = useState<Grouping>("none");
+  const [grouping, setGrouping] = useState<Grouping>(() => {
+    try {
+      return localStorage.getItem(groupingStorageKey) === "project" ? "project" : "none";
+    } catch {
+      return "none";
+    }
+  });
+  useEffect(() => {
+    try {
+      localStorage.setItem(groupingStorageKey, grouping);
+    } catch {
+      // Keep grouping usable when browser storage is unavailable.
+    }
+  }, [grouping]);
   const [reconnecting, setReconnecting] = useState(false);
   const handleConnected = useCallback(() => {
     setReconnecting(false);
